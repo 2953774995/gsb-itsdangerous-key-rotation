@@ -15,7 +15,7 @@ Use :meth:`~Serializer.dumps` to serialize and sign the data:
     from itsdangerous.serializer import Serializer
     s = Serializer("secret-key")
     s.dumps([1, 2, 3, 4])
-    b'[1, 2, 3, 4].r7R9RhGgDPvvWl3iNzLuIIfELmo'
+    b'v1-<kid>.[1, 2, 3, 4].<signature>'
 
 Use :meth:`~Serializer.loads` to verify the signature and deserialize
 the data.
@@ -31,6 +31,32 @@ module. This internal serializer can be changed by subclassing.
 To record and validate the age of the signature, see :doc:`/timed`.
 To serialize to a format that is safe to use in URLs, see
 :doc:`/url_safe`.
+
+
+Versioned Key Rotation
+----------------------
+
+Pass a :class:`~itsdangerous.KeyRing` to any serializer to emit a version 1
+envelope and verify it with the exact key named by its public ``kid``. The
+same object works with :class:`~itsdangerous.Signer`,
+:class:`~itsdangerous.TimestampSigner`, and the URL-safe serializers, so
+timestamps and compression keep their existing behavior.
+
+.. code-block:: python
+
+    import os
+    from itsdangerous import Key, KeyRing, URLSafeTimedSerializer
+
+    previous_key = os.urandom(32)
+    current_key = os.urandom(32)
+    ring = KeyRing([
+        Key.verification_only(previous_key, "old"),
+        Key.signing(current_key, "current"),
+    ])
+    serializer = URLSafeTimedSerializer(key_ring=ring)
+
+See :doc:`/concepts` for the envelope layout and the operational process for
+adding, retiring, expiring, and revoking keys.
 
 
 Responding to Failure

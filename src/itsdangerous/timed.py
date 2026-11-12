@@ -11,6 +11,7 @@ from .encoding import base64_encode
 from .encoding import bytes_to_int
 from .encoding import int_to_bytes
 from .encoding import want_bytes
+from .exc import BadHeader
 from .exc import BadSignature
 from .exc import BadTimeSignature
 from .exc import SignatureExpired
@@ -47,7 +48,9 @@ class TimestampSigner(Signer):
         value = want_bytes(value)
         timestamp = base64_encode(int_to_bytes(self.get_timestamp()))
         sep = want_bytes(self.sep)
-        value = value + sep + timestamp
+        key = self.key_ring.get_signing_key()
+        header = self._make_envelope_header(key.kid.encode("ascii"))
+        value = header + sep + value + sep + timestamp
         return value + sep + self.get_signature(value)
 
     # Ignore overlapping signatures check, return_timestamp is the only
@@ -88,6 +91,8 @@ class TimestampSigner(Signer):
         try:
             result = super().unsign(signed_value)
             sig_error = None
+        except BadHeader:
+            raise
         except BadSignature as e:
             sig_error = e
             result = e.payload or b""
@@ -213,6 +218,8 @@ class TimedSerializer(Serializer[_TSerialized]):
             except SignatureExpired:
                 # The signature was unsigned successfully but was
                 # expired. Do not try the next signer.
+                raise
+            except BadHeader:
                 raise
             except BadSignature as err:
                 last_exception = err

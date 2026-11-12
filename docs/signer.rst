@@ -11,7 +11,7 @@ class can be used to attach a signature to a specific string:
     from itsdangerous import Signer
     s = Signer("secret-key")
     s.sign("my string")
-    b'my string.wh6tMHxLgJqB6oY1uT73iMlyrOA'
+    b'v1-<kid>.my string.<signature>'
 
 The signature is appended to the string, separated by a dot. To validate
 the string, use the :meth:`~Signer.unsign` method:
@@ -38,6 +38,12 @@ unsigning will raise a :exc:`~itsdangerous.exc.BadSignature` exception:
 To record and validate the age of a signature, see :doc:`/timed`.
 
 .. autoclass:: Signer
+    :members:
+
+.. autoclass:: itsdangerous.keys.Key
+    :members:
+
+.. autoclass:: itsdangerous.keys.KeyRing
     :members:
 
 

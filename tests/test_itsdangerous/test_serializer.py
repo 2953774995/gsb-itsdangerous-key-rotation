@@ -189,8 +189,24 @@ def test_digests():
     sha1_value = factory(signer_kwargs={"digest_method": hashlib.sha1}).dumps([42])
     sha512_value = factory(signer_kwargs={"digest_method": hashlib.sha512}).dumps([42])
     assert default_value == sha1_value
-    assert sha1_value == "[42].-9cNi0CxsSB3hZPNCe9a2eEs1ZM"
-    assert sha512_value == (
+    assert sha1_value.startswith("v1-")
+    assert sha512_value.startswith("v1-")
+
+    legacy_sha1 = "[42].-9cNi0CxsSB3hZPNCe9a2eEs1ZM"
+    legacy_sha512 = (
         "[42].MKCz_0nXQqv7wKpfHZcRtJRmpT2T5uvs9YQsJEhJimqxc"
         "9bCLxG31QzS5uC8OVBI1i6jyOLAFNoKaF5ckO9L5Q"
+    )
+    assert factory(signer_kwargs={"digest_method": hashlib.sha1}).loads(
+        legacy_sha1
+    ) == [42]
+    assert factory(signer_kwargs={"digest_method": hashlib.sha512}).loads(
+        legacy_sha512
+    ) == [42]
+
+    assert sha512_value == (
+        "v1-"
+        + hashlib.sha256(b"dev key").hexdigest()
+        + ".[42]."
+        + sha512_value.rsplit(".", 1)[1]
     )

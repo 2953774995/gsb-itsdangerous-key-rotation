@@ -109,29 +109,64 @@ the key is rotated out after three weeks, they will not be able to use
 any keys they crack. However, if a user doesn't refresh their token
 within three weeks it will be invalid too.
 
-The system that generates and maintains this list is outside the scope
-of ItsDangerous, but ItsDangerous does support validating against a list
-of keys.
+The system that generates and maintains keys is outside the scope of
+ItsDangerous, but the library now supports explicit key lifecycle metadata
+through :class:`Key` and :class:`KeyRing`.
 
-Instead of passing a single key, you can pass a list of keys, oldest to
-newest. When signing the last (newest) key will be used, and when
-validating each key will be tried from newest to oldest before raising
-a validation error.
+Version 1 envelopes use this layout::
+
+    v1-<kid>.<payload>[.<timestamp>].<signature>
+
+``kid`` is public and limited to the unpadded URL-safe base64 alphabet, so
+it cannot contain the envelope separator. The HMAC input is the complete
+value before the final signature, including ``v1`` and ``kid``. Changing
+the version or key identifier therefore changes the bytes that the MAC
+covers and causes verification to fail. This prevents an attacker from
+downgrading an envelope or moving a valid signature onto another key.
+
+A token without a versioned header is handled by the legacy parser. A token
+that merely looks like version 1 still has to authenticate before the
+version-1 path accepts it, which keeps legacy payloads that may contain dots
+from being misclassified. An unsupported numeric version is rejected as a
+header error rather than being treated as a downgrade target.
+
+Configure one key with ``can_sign=True``. Retired keys remain available for
+verification only, optionally with an expiration time or a revocation flag.
 
 .. code-block:: python
 
-    SECRET_KEYS = ["2b9cd98e", "169d7886", "b6af09f5"]
+    import os
+    from datetime import datetime, timedelta, timezone
+    from itsdangerous import Key, KeyRing, URLSafeTimedSerializer
 
-    # sign some data with the latest key
-    s = Serializer(SECRET_KEYS)
-    t = s.dumps({"id": 42})
+    previous_key = os.urandom(32)
+    current_key = os.urandom(32)
+    now = datetime.now(timezone.utc)
+    ring = KeyRing(
+        [
+            Key.verification_only(
+                previous_key,
+                "2026-a",
+                expires_at=now + timedelta(days=30),
+            ),
+            Key.signing(current_key, "2026-b"),
+        ]
+    )
+    serializer = URLSafeTimedSerializer(key_ring=ring)
 
-    # rotate a new key in and the oldest key out
-    SECRET_KEYS.append("cf9b3588")
-    del SECRET_KEYS[0]
+To add a key, keep the current key as verification-only and add the new key
+with signing enabled. To terminate a retired key before its natural cutoff,
+set ``revoked=True`` or remove it from the ring. Removing a key rejects
+future verification for all tokens carrying that ``kid``; revocation gives
+you a distinct :exc:`~itsdangerous.exc.KeyRevoked` exception for audit
+logging. An expired key raises
+:exc:`~itsdangerous.exc.KeyExpired`, while a ``kid`` that is not configured
+raises :exc:`~itsdangerous.exc.UnknownKeyIdentifier`.
 
-    s = Serializer(SECRET_KEYS)
-    s.loads(t)  # valid even though it was signed with a previous key
+The traditional single-key and key-list constructors remain supported. They
+generate a stable SHA-256-based ``kid`` for each key, use the last key for
+signing, and retain the legacy verification path for tokens created before
+this feature.
 
 
 Digest Method Security

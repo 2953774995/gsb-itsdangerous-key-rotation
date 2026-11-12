@@ -3,13 +3,26 @@ from __future__ import annotations
 import collections.abc as cabc
 import hashlib
 import hmac
+import re
 import typing as t
+from datetime import datetime
+from datetime import timezone
 
 from .encoding import _base64_alphabet
 from .encoding import base64_decode
 from .encoding import base64_encode
 from .encoding import want_bytes
+from .exc import BadHeader
+from .exc import BadKeyIdentifier
 from .exc import BadSignature
+from .exc import KeyStatusError
+from .keys import KeyRing
+
+_SecretKeyInput = str | bytes | cabc.Iterable[str] | cabc.Iterable[bytes]
+_UNPADDED_BASE64URL_RE = re.compile(rb"[A-Za-z0-9_-]*\Z")
+_ENVELOPE_HEADER_RE = re.compile(rb"v1-([A-Za-z0-9_-]{1,128})$")
+_VERSIONED_HEADER_RE = re.compile(rb"v1-.*")
+_VERSION_PREFIX_RE = re.compile(rb"v\d+-")
 
 
 class SigningAlgorithm:
@@ -65,12 +78,22 @@ class HMACAlgorithm(SigningAlgorithm):
 
 
 def _make_keys_list(
-    secret_key: str | bytes | cabc.Iterable[str] | cabc.Iterable[bytes],
+    secret_key: _SecretKeyInput,
 ) -> list[bytes]:
     if isinstance(secret_key, (str, bytes)):
         return [want_bytes(secret_key)]
 
     return [want_bytes(s) for s in secret_key]  # pyright: ignore
+
+
+def _strict_base64_decode(value: bytes) -> bytes:
+    """Decode unpadded URL-safe base64 without accepting embedded NUL or
+    other non-alphabet characters ignored by the permissive legacy helper.
+    """
+    if _UNPADDED_BASE64URL_RE.fullmatch(value) is None:
+        raise BadSignature(f"Signature {value!r} is not valid base64url")
+
+    return base64_decode(value)
 
 
 class Signer:
@@ -98,10 +121,15 @@ class Signer:
     :param algorithm: A :class:`SigningAlgorithm` instance to use
         instead of building a default :class:`HMACAlgorithm` with the
         ``digest_method``.
+    :param key_ring: Explicit signing and verification key metadata. Use
+        this instead of ``secret_key`` for key rotation, expiration, and
+        revocation.
 
     .. versionchanged:: 2.0
         Added support for key rotation by passing a list to
         ``secret_key``.
+        New tokens use a version 1 envelope with an explicit key id; legacy
+        tokens remain verifiable.
 
     .. versionchanged:: 0.18
         ``algorithm`` was added as an argument to the class constructor.
@@ -128,19 +156,30 @@ class Signer:
 
     def __init__(
         self,
-        secret_key: str | bytes | cabc.Iterable[str] | cabc.Iterable[bytes],
+        secret_key: _SecretKeyInput | None = None,
         salt: str | bytes | None = b"itsdangerous.Signer",
         sep: str | bytes = b".",
         key_derivation: str | None = None,
         digest_method: t.Any | None = None,
         algorithm: SigningAlgorithm | None = None,
+        key_ring: KeyRing | None = None,
     ):
         #: The list of secret keys to try for verifying signatures, from
         #: oldest to newest. The newest (last) key is used for signing.
         #:
         #: This allows a key rotation system to keep a list of allowed
         #: keys and remove expired ones.
-        self.secret_keys: list[bytes] = _make_keys_list(secret_key)
+        if key_ring is not None and secret_key is not None:
+            raise ValueError("Use either 'key_ring' or 'secret_key', not both.")
+
+        if key_ring is None:
+            if secret_key is None:
+                raise TypeError("A secret key or key ring is required.")
+
+            key_ring = KeyRing.from_secret_keys(secret_key)
+
+        self.key_ring: KeyRing = key_ring
+        self.secret_keys: list[bytes] = key_ring.secret_keys
         self.sep: bytes = want_bytes(sep)
 
         if self.sep in _base64_alphabet:
@@ -179,6 +218,11 @@ class Signer:
         """
         return self.secret_keys[-1]
 
+    @property
+    def signing_kid(self) -> str:
+        """The public key identifier used for new signatures."""
+        return self.key_ring.get_signing_key().kid
+
     def derive_key(self, secret_key: str | bytes | None = None) -> bytes:
         """This method is called to derive the key. The default key
         derivation choices can be overridden here. Key derivation is not
@@ -215,31 +259,118 @@ class Signer:
     def get_signature(self, value: str | bytes) -> bytes:
         """Returns the signature for the given value."""
         value = want_bytes(value)
-        key = self.derive_key()
+        key = self.derive_key(self.key_ring.get_signing_key().secret)
         sig = self.algorithm.get_signature(key, value)
         return base64_encode(sig)
+
+    def _make_envelope_header(self, key_id: bytes) -> bytes:
+        return b"v1-" + key_id
+
+    def _parse_envelope_header(self, value: bytes) -> tuple[bytes, bytes] | None:
+        """Return ``(header, kid)`` for a syntactically valid v1 envelope.
+
+        The prefix alone is not trusted. A value that merely looks like v1
+        still has to authenticate before it is treated as the new format;
+        otherwise the legacy parser gets a chance to handle it.
+        """
+        first_segment, separator, _rest = value.partition(self.sep)
+
+        if not separator:
+            return None
+
+        match = _ENVELOPE_HEADER_RE.fullmatch(first_segment)
+
+        if match is not None:
+            return first_segment, match.group(1)
+
+        if _VERSIONED_HEADER_RE.fullmatch(first_segment) is not None:
+            raise BadKeyIdentifier(
+                "Malformed versioned key identifier header.", header=first_segment
+            )
+
+        if _VERSION_PREFIX_RE.match(first_segment) is not None:
+            raise BadHeader("Unsupported envelope version.", header=first_segment)
+
+        return None
 
     def sign(self, value: str | bytes) -> bytes:
         """Signs the given string."""
         value = want_bytes(value)
-        return value + self.sep + self.get_signature(value)
+        key = self.key_ring.get_signing_key()
+        header = self._make_envelope_header(key.kid.encode("ascii"))
+        signed_value = header + self.sep + value
+        return signed_value + self.sep + self.get_signature(signed_value)
 
-    def verify_signature(self, value: str | bytes, sig: str | bytes) -> bool:
+    def verify_signature(
+        self,
+        value: str | bytes,
+        sig: str | bytes,
+        secret_key: str | bytes | None = None,
+    ) -> bool:
         """Verifies the signature for the given value."""
         try:
-            sig = base64_decode(sig)
+            sig = _strict_base64_decode(want_bytes(sig))
         except Exception:
             return False
 
         value = want_bytes(value)
 
-        for secret_key in reversed(self.secret_keys):
-            key = self.derive_key(secret_key)
+        if secret_key is None:
+            secret_keys = list(self.secret_keys)
+        else:
+            secret_keys = [want_bytes(secret_key)]
+
+        # Constant-time MAC comparison happens in the algorithm. Iterate in
+        # reverse to preserve the newest-to-oldest legacy verification order.
+        for candidate in reversed(secret_keys):
+            key = self.derive_key(candidate)
 
             if self.algorithm.verify_signature(key, value, sig):
                 return True
 
         return False
+
+    def _verify_legacy_signature_at(
+        self, value: bytes, sig: bytes, current_time: datetime
+    ) -> bool:
+        for key in self.key_ring.verification_keys(now=current_time):
+            if self.verify_signature(value, sig, key.secret):
+                return True
+
+        return False
+
+    def _verify_legacy_signature(self, value: bytes, sig: bytes) -> bool:
+        return self._verify_legacy_signature_at(value, sig, datetime.now(timezone.utc))
+
+    def _unsign_versioned(self, value: bytes, sig: bytes, payload: bytes) -> bytes:
+        parsed = self._parse_envelope_header(value)
+
+        if parsed is None:
+            raise BadSignature(f"Signature {sig!r} does not match", payload=payload)
+
+        _header, kid = parsed
+        current_time = datetime.now(timezone.utc)
+
+        try:
+            key = self.key_ring.get_verification_key(kid, now=current_time)
+        except KeyStatusError as err:
+            # A revoked/expired candidate must not be silently accepted as a
+            # similarly prefixed legacy token. Unknown ids still preserve the
+            # legacy compatibility path below.
+            err.payload = payload
+            raise
+        except BadHeader as err:
+            err.payload = payload
+
+            if self._verify_legacy_signature_at(value, sig, current_time):
+                return value
+
+            raise
+
+        if not self.verify_signature(value, sig, key.secret):
+            raise BadSignature(f"Signature {sig!r} does not match", payload=payload)
+
+        return payload
 
     def unsign(self, signed_value: str | bytes) -> bytes:
         """Unsigns the given string."""
@@ -250,7 +381,21 @@ class Signer:
 
         value, sig = signed_value.rsplit(self.sep, 1)
 
-        if self.verify_signature(value, sig):
+        if self._parse_envelope_header(value) is not None:
+            _header, *payload_parts = value.split(self.sep)
+            payload = self.sep.join(payload_parts)
+
+            try:
+                return self._unsign_versioned(value, sig, payload)
+            except BadHeader:
+                raise
+            except BadSignature as err:
+                # Only syntactically valid v1 candidates reach this path.
+                # Their explicit prefix is an authenticated format selector,
+                # so a failed MAC must not be retried under the old format.
+                raise err
+
+        if self._verify_legacy_signature_at(value, sig, datetime.now(timezone.utc)):
             return value
 
         raise BadSignature(f"Signature {sig!r} does not match", payload=value)

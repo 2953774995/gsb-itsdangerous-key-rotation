@@ -89,6 +89,34 @@ class BadHeader(BadSignature):
         self.original_error: Exception | None = original_error
 
 
+class BadKeyIdentifier(BadHeader):
+    """Raised when a key identifier is missing or malformed."""
+
+
+class UnknownKeyIdentifier(BadKeyIdentifier):
+    """Raised when a token references a key identifier that is not
+    configured.
+    """
+
+
+class KeyStatusError(BadHeader):
+    """Raised when a referenced key cannot be used because of its
+    lifecycle status.
+    """
+
+
+class KeySigningError(KeyStatusError):
+    """Raised when no key is allowed to sign."""
+
+
+class KeyExpired(KeyStatusError):
+    """Raised when the referenced key has passed its expiration time."""
+
+
+class KeyRevoked(KeyStatusError):
+    """Raised when the referenced key has been revoked."""
+
+
 class BadPayload(BadData):
     """Raised if a payload is invalid. This could happen if the payload
     is loaded despite an invalid signature, or if there is a mismatch

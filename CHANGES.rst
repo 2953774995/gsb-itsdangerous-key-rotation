@@ -5,6 +5,12 @@ Unreleased
 
 -   Drop support for Python 3.8 and 3.9.
 -   Remove previously deprecated code.
+-   Add version 1 signed envelopes containing an explicit, URL-safe key
+    identifier (``kid``). New tokens use the configured signing key directly,
+    while tokens without an envelope continue to verify through the legacy
+    key-list path. Add :class:`~itsdangerous.Key` and
+    :class:`~itsdangerous.KeyRing` for signing, verification-only,
+    expiration, and revocation metadata.
 
 
 Version 2.2.0
